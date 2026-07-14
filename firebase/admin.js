@@ -1,37 +1,42 @@
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
-import dotenv from 'dotenv';
-import path from 'path';
+import { createRequire } from 'module';
+import { readFileSync, existsSync } from 'fs';
+import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 
-// Load .env from the root/client folder (or wherever it lives)
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, '../../client/.env') });
-// We'll also load local .env if it exists
 dotenv.config();
 
-// Note: To make this work, the user needs to download a serviceAccountKey.json 
-// from Firebase Console -> Project Settings -> Service Accounts -> Generate New Private Key
-// and place it in the server/ directory.
-let db;
-try {
-  // If serviceAccountKey.json is missing, this will fail gracefully or we can mock it
-  // For production, always use the secure JSON key.
-  // const serviceAccount = require('./serviceAccountKey.json'); // commonjs way
-  // We'll dynamically import or require since we are in ES Module:
-  import { createRequire } from 'module';
-  const require = createRequire(import.meta.url);
-  const serviceAccount = require('../serviceAccountKey.json');
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-  initializeApp({
-    credential: cert(serviceAccount)
-  });
-  
+let db;
+
+try {
+  // Try to load serviceAccountKey.json from the project root
+  const keyPath = resolve(__dirname, '../serviceAccountKey.json');
+
+  let serviceAccount;
+
+  if (existsSync(keyPath)) {
+    // Local development: read from file
+    serviceAccount = JSON.parse(readFileSync(keyPath, 'utf8'));
+    console.log('🔑 Loaded serviceAccountKey.json from file.');
+  } else {
+    // Production (Render): read from environment variable
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (!raw) {
+      throw new Error('Neither serviceAccountKey.json nor FIREBASE_SERVICE_ACCOUNT env var found!');
+    }
+    serviceAccount = JSON.parse(raw);
+    console.log('🔑 Loaded Firebase credentials from environment variable.');
+  }
+
+  initializeApp({ credential: cert(serviceAccount) });
   db = getFirestore();
-  console.log("🔥 Firebase Admin Initialized successfully.");
+  console.log('🔥 Firebase Admin Initialized successfully.');
 } catch (error) {
-  console.warn("⚠️ Firebase Admin could not be initialized. Missing serviceAccountKey.json!");
-  console.warn("Please download your service account key from Firebase and place it at server/serviceAccountKey.json");
+  console.error('❌ Firebase Admin initialization failed:', error.message);
 }
 
 export { db, FieldValue };
