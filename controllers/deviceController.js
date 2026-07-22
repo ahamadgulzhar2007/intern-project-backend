@@ -8,89 +8,108 @@ const alertCache = {}; // Tracks if an email was sent for an ongoing overload
 export const updateDevice = async (req, res) => {
   try {
     const { deviceId, firmware, sensors, dc, ac, relay, status } = req.body;
-    
+
     if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId required' });
 
     const deviceRef = db.collection('devices').doc(deviceId);
-    
+
     // 1. Get or refresh config (cache it for 15 seconds)
     const now = Date.now();
     let config = configCache[deviceId]?.data;
-    if (!config || (now - configCache[deviceId].timestamp > 15000)) {
+    if (!config || (now - (configCache[deviceId]?.timestamp || 0) > 15000)) {
       const configDoc = await deviceRef.collection('config').doc('settings').get();
       if (configDoc.exists) {
         config = configDoc.data();
         configCache[deviceId] = { data: config, timestamp: now };
       } else {
-        // Default config if none exists
-        config = { currentLimit: 10, voltageMin: 0, voltageMax: 250 };
+        // Sensible defaults — DC uses INA219 (max ~3.2A), AC uses ZMPT/ACS712
+        config = {
+          dcCurrentLimit:  2.0,   // Amps — trip if DC current > 2A
+          acCurrentLimit:  10.0,  // Amps — trip if AC current > 10A
+          voltageMin:      0,
+          voltageMax:      250
+        };
+        // Write defaults into Firestore so Settings page can show/edit them
+        await deviceRef.collection('config').doc('settings').set(config);
+        configCache[deviceId] = { data: config, timestamp: now };
       }
     }
 
-    // 2. Read desired relay state from info/status to see if Dashboard turned it off/on
-    // (We might want to cache this too, or rely on the frontend sending control commands)
+    // 2. Read desired relay state & alert email from Firestore
     const infoDoc = await deviceRef.collection('info').doc('state').get();
-    let desiredRelay = infoDoc.exists ? infoDoc.data().relay : relay;
-    let alertEmail = infoDoc.exists ? infoDoc.data().alertEmail : null;
+    let desiredRelay = infoDoc.exists ? (infoDoc.data().relay ?? relay) : relay;
+    let alertEmail   = infoDoc.exists ? infoDoc.data().alertEmail : null;
 
-    // 3. Overload Logic (Threshold check)
-    let isOverload = false;
-    if (ac?.current > (config.currentLimit || 10) || dc?.current > (config.currentLimit || 5)) {
-      isOverload = true;
-      desiredRelay = false; // Force relay off
+    // 3. ── Overload Logic ──────────────────────────────────────────
+    // Separate thresholds for AC and DC
+    const dcLimit = config.dcCurrentLimit ?? config.currentLimit ?? 2.0;
+    const acLimit = config.acCurrentLimit ?? config.currentLimit ?? 10.0;
+
+    const dcOverload = dc?.current  != null && dc.current  > dcLimit;
+    const acOverload = ac?.current  != null && ac.current  > acLimit && ac?.enabled !== false;
+    const isOverload = dcOverload || acOverload;
+
+    // Build a human-readable overload reason
+    let overloadReason = '';
+    if (dcOverload) overloadReason += `DC current ${dc.current.toFixed(2)}A > limit ${dcLimit}A. `;
+    if (acOverload) overloadReason += `AC current ${ac.current.toFixed(2)}A > limit ${acLimit}A.`;
+
+    if (isOverload) {
+      desiredRelay = false; // Force relay OFF immediately
     }
+    // ─────────────────────────────────────────────────────────────
 
-    // 4. Update live readings & info
+    // 4. Update live readings & info in one batch
     const batch = db.batch();
-    
+
     // info/state
     batch.set(deviceRef.collection('info').doc('state'), {
-      online: true,
-      lastSeen: FieldValue.serverTimestamp(),
-      firmware: firmware || 'unknown',
+      online:       true,
+      lastSeen:     FieldValue.serverTimestamp(),
+      firmware:     firmware || 'unknown',
       sensorHealth: sensors || {},
-      relay: desiredRelay,
-      status: isOverload ? 'OVERLOAD' : 'NORMAL'
+      relay:        desiredRelay,
+      status:       isOverload ? 'OVERLOAD' : (status || 'NORMAL')
     }, { merge: true });
 
     // live/current_readings
     const readings = {
-      ac: ac || {},
-      dc: dc || {},
-      relay: desiredRelay,
-      status: isOverload ? 'OVERLOAD' : 'NORMAL',
+      ac:        ac  || {},
+      dc:        dc  || {},
+      relay:     desiredRelay,
+      status:    isOverload ? 'OVERLOAD' : (status || 'NORMAL'),
       updatedAt: FieldValue.serverTimestamp()
     };
     batch.set(deviceRef.collection('live').doc('current_readings'), readings);
 
-    // history (log every update)
+    // history
     batch.set(deviceRef.collection('history').doc(), {
       ...readings,
       timestamp: FieldValue.serverTimestamp()
     });
 
-    // 5. Handle Overload Alert & Email
+    // 5. Handle Overload Alert & Email (throttle: only once per event)
     if (isOverload) {
       if (!alertCache[deviceId]) {
-        // First time seeing this overload
         alertCache[deviceId] = true;
-        
+
         batch.set(deviceRef.collection('alerts').doc(), {
-          type: 'OVERLOAD',
-          ac: ac || {},
-          dc: dc || {},
-          relay: false,
-          time: FieldValue.serverTimestamp()
+          type:   'OVERLOAD',
+          reason: overloadReason,
+          ac:     ac || {},
+          dc:     dc || {},
+          relay:  false,
+          time:   FieldValue.serverTimestamp()
         });
 
-        // Send Email asynchronously
         if (alertEmail) {
-          sendOverloadEmail(alertEmail, deviceId, readings).catch(console.error);
+          sendOverloadEmail(alertEmail, deviceId, { ...readings, overloadReason }).catch(console.error);
         }
+
+        console.log(`⚠️  OVERLOAD on ${deviceId}: ${overloadReason}`);
       }
     } else {
-      // Clear alert cache when normal
-      alertCache[deviceId] = false;
+      alertCache[deviceId] = false; // Reset so next overload fires a new email
     }
 
     await batch.commit();
@@ -98,12 +117,18 @@ export const updateDevice = async (req, res) => {
     // 6. Return response to ESP32
     return res.status(200).json({
       success: true,
-      relay: desiredRelay,
-      config: config
+      relay:   desiredRelay,
+      status:  isOverload ? 'OVERLOAD' : 'NORMAL',
+      config:  {
+        dcCurrentLimit: dcLimit,
+        acCurrentLimit: acLimit,
+        voltageMin:     config.voltageMin,
+        voltageMax:     config.voltageMax
+      }
     });
 
   } catch (error) {
-    console.error("Update Device Error:", error);
+    console.error('Update Device Error:', error);
     return res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -118,7 +143,7 @@ export const controlDevice = async (req, res) => {
     await db.collection('devices').doc(deviceId)
             .collection('info').doc('state')
             .set({ relay }, { merge: true });
-            
+
     return res.status(200).json({ success: true, message: 'Control command sent' });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
