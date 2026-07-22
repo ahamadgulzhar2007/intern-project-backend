@@ -5,8 +5,14 @@ dotenv.config();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 export const sendOverloadEmail = async (email, deviceId, readings) => {
-  if (!email || !process.env.RESEND_API_KEY) return;
-  
+  if (!email) {
+    console.error("❌ Email sending skipped: No recipient email provided.");
+    return null;
+  }
+  if (!process.env.RESEND_API_KEY) {
+    console.error("❌ Email sending skipped: RESEND_API_KEY is missing in Render Environment Variables!");
+    return null;
+  }  
   const time = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
   
   const html = `
