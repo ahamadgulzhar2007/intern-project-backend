@@ -93,17 +93,26 @@ export const updateDevice = async (req, res) => {
       if (!alertCache[deviceId]) {
         alertCache[deviceId] = true;
 
-        batch.set(deviceRef.collection('alerts').doc(), {
+        const alertDocRef = deviceRef.collection('alerts').doc();
+        batch.set(alertDocRef, {
           type:   'OVERLOAD',
           reason: overloadReason,
           ac:     ac || {},
           dc:     dc || {},
           relay:  false,
-          time:   FieldValue.serverTimestamp()
+          time:   FieldValue.serverTimestamp(),
+          emailSent: false
         });
 
         if (alertEmail) {
-          sendOverloadEmail(alertEmail, deviceId, { ...readings, overloadReason }).catch(console.error);
+          sendOverloadEmail(alertEmail, deviceId, { ...readings, overloadReason })
+            .then(data => {
+              if (data) {
+                console.log(`✅ Email sent to ${alertEmail}`);
+                alertDocRef.update({ emailSent: true }).catch(console.error);
+              }
+            })
+            .catch(err => console.error("❌ Email failed:", err));
         }
 
         console.log(`⚠️  OVERLOAD on ${deviceId}: ${overloadReason}`);
